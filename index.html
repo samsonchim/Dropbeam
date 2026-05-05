@@ -935,11 +935,41 @@
 const WS_URL = 'wss://squid-app-8svgq.ondigitalocean.app';
 
 const ICE_SERVERS = [
+  // Google STUN servers (primary)
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+  { urls: 'stun:stun4.l.google.com:19302' },
+
+  // Cloudflare TURN (free, reliable, global anycast) [^29^]
+  { 
+    urls: 'turn:turn.cloudflare.com:3478?transport=udp',
+    username: 'dropbeam',
+    credential: 'dropbeam'
+  },
+  { 
+    urls: 'turn:turn.cloudflare.com:3478?transport=tcp',
+    username: 'dropbeam', 
+    credential: 'dropbeam'
+  },
+  { 
+    urls: 'turns:turn.cloudflare.com:5349?transport=tcp',
+    username: 'dropbeam',
+    credential: 'dropbeam'
+  },
+
+  // ExpressTURN backup (free tier) [^30^]
+  {
+    urls: 'turn:freeturn.net:3478?transport=udp',
+    username: 'free',
+    credential: 'free'
+  },
+  {
+    urls: 'turn:freeturn.net:3478?transport=tcp',
+    username: 'free',
+    credential: 'free'
+  },
 ];
 
 const CHUNK_SIZE = 64 * 1024;
@@ -1225,7 +1255,11 @@ function createPeerConnection(peerId, initiator) {
   }
 
   console.log('Creating peer connection to', peerId, 'initiator=', initiator);
-  const conn = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  const conn = new RTCPeerConnection({ 
+    iceServers: ICE_SERVERS,
+    iceCandidatePoolSize: 10,
+    iceTransportPolicy: 'all'
+  });
 
   // channelReady resolves when data channel opens, rejects on fatal error
   let resolveChannel, rejectChannel;
@@ -1270,14 +1304,23 @@ function createPeerConnection(peerId, initiator) {
     } else if (state === 'connecting') {
       renderPeersBar();
     } else if (state === 'disconnected') {
-      // Give it 10 seconds to recover before cleaning up
+      // Give it 10 seconds to recover, then try ICE restart
       clearTimeout(disconnectTimer);
-      disconnectTimer = setTimeout(() => {
-        if (peers[peerId] && peers[peerId].conn.connectionState === 'disconnected') {
-          console.log('Peer', peerId, 'remained disconnected, cleaning up');
-          cleanupPeer(peerId);
+      disconnectTimer = setTimeout(async () => {
+        if (!peers[peerId]) return;
+        const currentState = peers[peerId].conn.connectionState;
+        if (currentState === 'disconnected' || currentState === 'failed') {
+          console.log('Attempting ICE restart for', peerId);
+          try {
+            const offer = await conn.createOffer({ iceRestart: true });
+            await conn.setLocalDescription(offer);
+            sendWS({ type: 'signal', to: peerId, data: { offer: conn.localDescription } });
+          } catch (err) {
+            console.error('ICE restart failed for', peerId, err);
+            cleanupPeer(peerId);
+          }
         }
-      }, 10000);
+      }, 8000);
     } else if (state === 'failed' || state === 'closed') {
       clearTimeout(disconnectTimer);
       console.log('Connection failed/closed with', peerId);
@@ -1390,6 +1433,11 @@ async function handleSignal(peerId, data) {
       if (conn.signalingState === 'have-local-offer') {
         console.warn('Glare condition! Both sides offered. Ignoring remote offer.');
         return;
+      }
+
+      // For ICE restart, we need to handle existing connection
+      if (conn.signalingState === 'stable' && conn.remoteDescription) {
+        console.log('ICE restart offer received from', peerId);
       }
 
       await conn.setRemoteDescription(new RTCSessionDescription(data.offer));
