@@ -1149,11 +1149,12 @@ function handleServerMsg(msg) {
   switch (msg.type) {
     case 'room-joined':
       myPeerId = msg.peerId;
-      msg.peers.forEach(pid => createPeerConnection(pid, true));
+      msg.peers.forEach(pid => createPeerConnection(pid, true));  // I connect OUT to existing
       break;
 
     case 'peer-joined':
       showToast('New peer joined the room');
+      createPeerConnection(msg.peerId, false);  // ✅ FIX: I accept IN from newcomer
       break;
 
     case 'peer-left':
@@ -1170,6 +1171,7 @@ function handleServerMsg(msg) {
       break;
   }
 }
+ 
 
 // ─── WEBRTC ──────────────────────────────────────────────────────────────────
 function createPeerConnection(peerId, initiator) {
