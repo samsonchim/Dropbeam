@@ -937,6 +937,8 @@ const ICE_SERVERS = [
 ];
 
 const CHUNK_SIZE = 64 * 1024;
+const RECONNECT_DELAY = 2000;
+const MAX_RECONNECT_DELAY = 30000;
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
 let ws = null;
@@ -945,6 +947,13 @@ let currentRoom = null;
 let peers = {};
 let transfers = {};
 let transferCount = 0;
+let reconnectTimer = null;
+let reconnectDelay = RECONNECT_DELAY;
+let isIntentionalLeave = false;
+
+// Files shared in this room — so late joiners can download them
+// { id, name, size, mime, blob }
+let sharedFiles = [];
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
 function genCode() {
@@ -1082,6 +1091,11 @@ function addTransferUI(id, name, size, direction) {
   list.scrollTop = list.scrollHeight;
 }
 
+function updateTransferStatus(transferId, text) {
+  const status = document.getElementById('status-' + transferId);
+  if (status) { status.textContent = text; status.className = 'transfer-status'; }
+}
+
 function updateTransferProgress(id, progress, direction) {
   const prog = document.getElementById('prog-' + id);
   const status = document.getElementById('status-' + id);
@@ -1120,18 +1134,29 @@ function connectWS() {
 
     ws.onopen = () => {
       setStatus('online', 'connected');
+      reconnectDelay = RECONNECT_DELAY; // reset backoff
+      // If we were in a room, rejoin automatically
+      if (currentRoom) {
+        // Clean up stale peer connections
+        Object.values(peers).forEach(p => { try { p.conn.close(); } catch(e){} });
+        peers = {};
+        sendWS({ type: 'join', room: currentRoom });
+        showToast('Reconnected — rejoining room…');
+      }
       resolve();
     };
 
     ws.onerror = () => {
       setStatus('', 'error');
-      document.getElementById('server-warning').style.display = 'block';
       reject(new Error('WebSocket error'));
     };
 
     ws.onclose = () => {
       setStatus('', 'disconnected');
-      if (currentRoom) showToast('Server connection lost');
+      if (!isIntentionalLeave && currentRoom) {
+        showToast(`Connection lost — reconnecting in ${reconnectDelay / 1000}s…`);
+        scheduleReconnect();
+      }
     };
 
     ws.onmessage = (event) => {
@@ -1139,6 +1164,18 @@ function connectWS() {
       handleServerMsg(msg);
     };
   });
+}
+
+function scheduleReconnect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(async () => {
+    try {
+      await connectWS();
+    } catch(e) {
+      reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
+      scheduleReconnect();
+    }
+  }, reconnectDelay);
 }
 
 function sendWS(obj) {
@@ -1152,19 +1189,19 @@ function handleServerMsg(msg) {
   switch (msg.type) {
     case 'room-joined':
       myPeerId = msg.peerId;
-      msg.peers.forEach(pid => createPeerConnection(pid, false));  // wait for existing peers to initiate
+      msg.peers.forEach(pid => createPeerConnection(pid, false));
       renderPeersBar();
       break;
 
     case 'peer-joined':
       showToast('New peer joined the room');
-      createPeerConnection(msg.peerId, true);  // existing peer initiates to newcomer
+      createPeerConnection(msg.peerId, true);
       renderPeersBar();
       break;
 
     case 'peer-left':
       if (peers[msg.peerId]) {
-        peers[msg.peerId].conn.close();
+        try { peers[msg.peerId].conn.close(); } catch(e) {}
         delete peers[msg.peerId];
         renderPeersBar();
         showToast('Peer left the room');
@@ -1183,7 +1220,7 @@ function createPeerConnection(peerId, initiator) {
   if (peers[peerId]) return;
 
   const conn = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  peers[peerId] = { conn, channel: null };
+  peers[peerId] = { conn, channel: null, initiator };
 
   conn.onicecandidate = (e) => {
     if (e.candidate) {
@@ -1192,11 +1229,25 @@ function createPeerConnection(peerId, initiator) {
   };
 
   conn.onconnectionstatechange = () => {
-    if (conn.connectionState === 'connected') {
+    const state = conn.connectionState;
+    if (state === 'connected') {
       renderPeersBar();
-    } else if (conn.connectionState === 'disconnected' || conn.connectionState === 'failed') {
-      delete peers[peerId];
-      renderPeersBar();
+    } else if (state === 'failed') {
+      if (peers[peerId] && peers[peerId].initiator) {
+        conn.restartIce();
+        conn.createOffer({ iceRestart: true }).then(offer => {
+          conn.setLocalDescription(offer);
+          sendWS({ type: 'signal', to: peerId, data: { offer } });
+        });
+      }
+    } else if (state === 'disconnected') {
+      setTimeout(() => {
+        if (peers[peerId] && peers[peerId].conn.connectionState === 'disconnected') {
+          try { peers[peerId].conn.close(); } catch(e) {}
+          delete peers[peerId];
+          renderPeersBar();
+        }
+      }, 5000);
     }
   };
 
@@ -1243,6 +1294,10 @@ function setupDataChannel(channel, peerId) {
 
   channel.onopen = () => {
     renderPeersBar();
+    // Send any files already shared in this room to the new peer
+    if (sharedFiles.length > 0) {
+      sharedFiles.forEach(f => sendFileToPeer(f.blob, channel, f.id, f.name, f.size, f.mime));
+    }
   };
 
   channel.onclose = () => {
@@ -1282,13 +1337,16 @@ function setupDataChannel(channel, peerId) {
 }
 
 // ─── SEND FILE ───────────────────────────────────────────────────────────────
-async function sendFileToPeer(file, channel, transferId) {
+async function sendFileToPeer(file, channel, transferId, nameOverride, sizeOverride, mimeOverride) {
+  const fileName = nameOverride || file.name;
+  const fileSize = sizeOverride || file.size;
+  const fileMime = mimeOverride || file.type || 'application/octet-stream';
   channel.send(JSON.stringify({
     type: 'file-start',
     id: transferId,
-    name: file.name,
-    size: file.size,
-    mime: file.type || 'application/octet-stream',
+    name: fileName,
+    size: fileSize,
+    mime: fileMime,
   }));
 
   let offset = 0;
@@ -1327,16 +1385,22 @@ function waitForBuffer(channel, threshold = 1024 * 1024) {
 }
 
 async function sendFileToAll(file) {
+  const transferId = Math.random().toString(36).substr(2, 10);
+
+  // Store file so late-joining peers can receive it automatically
+  sharedFiles.push({ id: transferId, blob: file, name: file.name, size: file.size, mime: file.type || 'application/octet-stream' });
+
   const connectedPeers = Object.values(peers).filter(p => p.channel && p.channel.readyState === 'open');
 
   if (connectedPeers.length === 0) {
-    showToast('No peers connected yet. Share the room code first!');
+    // No peers yet — show it in transfers as "waiting"
+    addTransferUI(transferId, file.name, file.size, 'send');
+    updateTransferStatus(transferId, 'Waiting for peers…');
+    showToast('File queued — will send when a peer joins!');
     return;
   }
 
-  const transferId = Math.random().toString(36).substr(2, 10);
   addTransferUI(transferId, file.name, file.size, 'send');
-
   await Promise.all(connectedPeers.map(p => sendFileToPeer(file, p.channel, transferId)));
 }
 
@@ -1355,11 +1419,14 @@ async function joinRoom(code) {
 }
 
 function leaveRoom() {
+  isIntentionalLeave = true;
+  clearTimeout(reconnectTimer);
   sendWS({ type: 'leave' });
-  Object.values(peers).forEach(p => p.conn.close());
+  Object.values(peers).forEach(p => { try { p.conn.close(); } catch(e) {} });
   peers = {};
   transfers = {};
   transferCount = 0;
+  sharedFiles = [];
 
   document.getElementById('transfers-list').innerHTML = `
     <div class="empty-state">
