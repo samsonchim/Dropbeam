@@ -931,6 +931,9 @@ const WS_URL = 'wss://squid-app-8svgq.ondigitalocean.app';
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 
 const CHUNK_SIZE = 64 * 1024;
@@ -1150,11 +1153,13 @@ function handleServerMsg(msg) {
     case 'room-joined':
       myPeerId = msg.peerId;
       msg.peers.forEach(pid => createPeerConnection(pid, false));  // wait for existing peers to initiate
+      renderPeersBar();
       break;
 
     case 'peer-joined':
       showToast('New peer joined the room');
       createPeerConnection(msg.peerId, true);  // existing peer initiates to newcomer
+      renderPeersBar();
       break;
 
     case 'peer-left':
