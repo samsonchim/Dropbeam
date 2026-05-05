@@ -1,32 +1,47 @@
+
 // DropBeam Signaling Server
 // Run with: node server.js
 // Requires: npm install ws
 
 const WebSocket = require("ws");
 const http = require("http");
-const fs = require("fs");
-const path = require("path");
 
 const PORT = process.env.PORT || 8080;
+const FRONTEND_URL = "https://dropbeam-mu.vercel.app";
 
 const server = http.createServer((req, res) => {
-  // Serve the index.html file
-  if (req.url === "/" || req.url === "/index.html") {
-    const filePath = path.join(__dirname, "index.html");
-    if (fs.existsSync(filePath)) {
-      res.writeHead(200, { "Content-Type": "text/html" });
-      fs.createReadStream(filePath).pipe(res);
-    } else {
-      res.writeHead(404);
-      res.end("index.html not found. Place it in the same folder as server.js");
-    }
-  } else {
-    res.writeHead(404);
-    res.end("Not found");
+  res.setHeader("Access-Control-Allow-Origin", FRONTEND_URL);
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
   }
+
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", frontend: FRONTEND_URL }));
+    return;
+  }
+
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("DropBeam signaling server is running.");
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({
+  server,
+  verifyClient: ({ origin }, callback) => {
+    // Allow connections from the Vercel frontend or no origin (e.g. server-to-server)
+    if (!origin || origin === FRONTEND_URL) {
+      callback(true);
+    } else {
+      console.warn(`Rejected WebSocket connection from origin: ${origin}`);
+      callback(false, 403, "Forbidden");
+    }
+  },
+});
 
 // rooms: { roomCode: Set<WebSocket> }
 const rooms = new Map();
@@ -128,5 +143,5 @@ wss.on("connection", (ws) => {
 server.listen(PORT, () => {
   console.log(`\n✅ DropBeam server running at http://localhost:${PORT}`);
   console.log(`📡 WebSocket signaling active on ws://localhost:${PORT}`);
-  console.log(`\nShare http://localhost:${PORT} on your local network (or deploy to a server)\n`);
+  console.log(`🌐 Accepting connections from: ${FRONTEND_URL}\n`);
 });
