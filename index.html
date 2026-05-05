@@ -1196,6 +1196,8 @@ function handleServerMsg(msg) {
       showToast('New peer joined the room');
       if (!peers[msg.peerId]) {
         createPeerConnection(msg.peerId, true);  // existing peer initiates to newcomer
+      } else {
+        console.log('Peer', msg.peerId, 'already known, ignoring peer-joined');
       }
       break;
 
@@ -1217,72 +1219,149 @@ function handleServerMsg(msg) {
 
 // ─── WEBRTC ──────────────────────────────────────────────────────────────────
 function createPeerConnection(peerId, initiator) {
-  if (peers[peerId]) return; // already exists, don't duplicate
+  if (peers[peerId]) {
+    console.log('Peer', peerId, 'already exists, skipping duplicate');
+    return;
+  }
 
+  console.log('Creating peer connection to', peerId, 'initiator=', initiator);
   const conn = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  // channelReady is a promise that resolves when the data channel is open
-  let resolveChannel;
-  const channelReady = new Promise(res => { resolveChannel = res; });
-  peers[peerId] = { conn, channel: null, channelReady, initiator };
-  renderPeersBar(); // Update UI immediately when peer is added
 
+  // channelReady resolves when data channel opens, rejects on fatal error
+  let resolveChannel, rejectChannel;
+  const channelReady = new Promise((res, rej) => { 
+    resolveChannel = res; 
+    rejectChannel = rej;
+  });
+
+  // Track connection state and cleanup timers
+  let disconnectTimer = null;
+  let iceCandidates = []; // Buffer candidates until remote desc is set
+  let hasRemoteDesc = false;
+
+  peers[peerId] = { 
+    conn, 
+    channel: null, 
+    channelReady, 
+    initiator,
+    resolveChannel,
+    rejectChannel,
+    disconnectTimer
+  };
+  renderPeersBar();
+
+  // ICE candidate handling with buffering
   conn.onicecandidate = (e) => {
     if (e.candidate) {
+      console.log('Sending ICE candidate to', peerId);
       sendWS({ type: 'signal', to: peerId, data: { candidate: e.candidate } });
+    } else {
+      console.log('ICE gathering complete for', peerId);
     }
   };
 
   conn.onconnectionstatechange = () => {
     const state = conn.connectionState;
     console.log('Connection state with', peerId, ':', state);
-    if (state === 'connected' || state === 'connecting') {
+
+    if (state === 'connected') {
+      clearTimeout(disconnectTimer);
       renderPeersBar();
+    } else if (state === 'connecting') {
+      renderPeersBar();
+    } else if (state === 'disconnected') {
+      // Give it 10 seconds to recover before cleaning up
+      clearTimeout(disconnectTimer);
+      disconnectTimer = setTimeout(() => {
+        if (peers[peerId] && peers[peerId].conn.connectionState === 'disconnected') {
+          console.log('Peer', peerId, 'remained disconnected, cleaning up');
+          cleanupPeer(peerId);
+        }
+      }, 10000);
     } else if (state === 'failed' || state === 'closed') {
-      // Clean up on hard failure or close
+      clearTimeout(disconnectTimer);
       console.log('Connection failed/closed with', peerId);
-      try { conn.close(); } catch(e) {}
-      delete peers[peerId];
-      renderPeersBar();
+      cleanupPeer(peerId);
     }
-    // 'disconnected' is transient — WebRTC may recover on its own, don't delete
   };
 
   conn.oniceconnectionstatechange = () => {
     console.log('ICE state with', peerId, ':', conn.iceConnectionState);
   };
 
+  conn.onsignalingstatechange = () => {
+    console.log('Signaling state with', peerId, ':', conn.signalingState);
+  };
+
+  function cleanupPeer(pid) {
+    if (!peers[pid]) return;
+    try { peers[pid].conn.close(); } catch(e) {}
+    clearTimeout(peers[pid].disconnectTimer);
+    delete peers[pid];
+    renderPeersBar();
+  }
+
   function onChannelOpen(channel) {
-    if (!peers[peerId]) return; // Peer may have been removed
+    if (!peers[peerId]) {
+      console.log('Peer', peerId, 'gone, ignoring channel open');
+      return;
+    }
+    console.log('Data channel OPEN with', peerId);
     peers[peerId].channel = channel;
     resolveChannel(channel);
     renderPeersBar();
     showToast('Peer connected — ready to share files');
-    // Send any files already shared in this room to the new peer
+
+    // Send queued files to new peer
     sharedFiles.forEach(f => {
-      sendFileToPeer(f.blob, channel, f.id, f.name, f.size, f.mime).catch(console.error);
+      sendFileToPeer(f.blob, channel, f.id, f.name, f.size, f.mime).catch(err => {
+        console.error('Failed to send queued file to', peerId, err);
+      });
     });
   }
 
+  function onChannelError(err) {
+    console.error('Data channel error with', peerId, err);
+    if (peers[peerId]) {
+      peers[peerId].channel = null;
+      // Reject channelReady so waiting sends fail fast
+      rejectChannel(new Error('Data channel error'));
+    }
+  }
+
   if (initiator) {
+    console.log('Creating data channel as initiator to', peerId);
     const channel = conn.createDataChannel('files', { ordered: true });
-    setupDataChannel(channel, peerId);
+    setupDataChannel(channel, peerId, onChannelError);
+
     channel.addEventListener('open', () => onChannelOpen(channel), { once: true });
+    channel.addEventListener('error', onChannelError, { once: true });
 
     conn.createOffer()
-      .then(offer => conn.setLocalDescription(offer))
+      .then(offer => {
+        console.log('Created offer for', peerId);
+        return conn.setLocalDescription(offer);
+      })
       .then(() => {
-        console.log('Sending offer to', peerId);
+        console.log('Sending offer to', peerId, 'SDP:', conn.localDescription.sdp.substring(0, 100) + '...');
         sendWS({ type: 'signal', to: peerId, data: { offer: conn.localDescription } });
       })
-      .catch(err => console.error('Error creating offer for', peerId, err));
+      .catch(err => {
+        console.error('Error creating offer for', peerId, err);
+        cleanupPeer(peerId);
+      });
   } else {
+    console.log('Waiting for data channel from', peerId);
     conn.ondatachannel = (e) => {
+      console.log('Received data channel from', peerId);
       const channel = e.channel;
-      setupDataChannel(channel, peerId);
+      setupDataChannel(channel, peerId, onChannelError);
+
       if (channel.readyState === 'open') {
         onChannelOpen(channel);
       } else {
         channel.addEventListener('open', () => onChannelOpen(channel), { once: true });
+        channel.addEventListener('error', onChannelError, { once: true });
       }
     };
   }
@@ -1295,50 +1374,101 @@ async function handleSignal(peerId, data) {
     createPeerConnection(peerId, false);
   }
 
-  const conn = peers[peerId].conn;
-  if (!conn) {
+  const peer = peers[peerId];
+  if (!peer || !peer.conn) {
     console.warn('No connection for peer', peerId);
     return;
   }
 
+  const conn = peer.conn;
+
   try {
     if (data.offer) {
-      console.log('Received offer from', peerId);
-      if (conn.signalingState !== 'stable' && conn.signalingState !== 'have-local-offer') {
-        console.warn('Unexpected signaling state for offer:', conn.signalingState);
+      console.log('Received offer from', peerId, 'current state:', conn.signalingState);
+
+      // Handle glare: if we already sent an offer, ignore this one or rollback
+      if (conn.signalingState === 'have-local-offer') {
+        console.warn('Glare condition! Both sides offered. Ignoring remote offer.');
+        return;
       }
+
       await conn.setRemoteDescription(new RTCSessionDescription(data.offer));
+      console.log('Set remote description (offer) from', peerId);
+
+      // Add any buffered candidates now that remote desc is set
+      if (peer.iceCandidates && peer.iceCandidates.length > 0) {
+        console.log('Adding', peer.iceCandidates.length, 'buffered ICE candidates');
+        for (const candidate of peer.iceCandidates) {
+          await conn.addIceCandidate(new RTCIceCandidate(candidate));
+        }
+        peer.iceCandidates = [];
+      }
+
       const answer = await conn.createAnswer();
       await conn.setLocalDescription(answer);
-      sendWS({ type: 'signal', to: peerId, data: { answer } });
-      console.log('Sent answer to', peerId);
+      console.log('Sending answer to', peerId);
+      sendWS({ type: 'signal', to: peerId, data: { answer: conn.localDescription } });
+
     } else if (data.answer) {
-      console.log('Received answer from', peerId);
+      console.log('Received answer from', peerId, 'current state:', conn.signalingState);
+
       if (conn.signalingState !== 'have-local-offer') {
-        console.warn('Unexpected signaling state for answer:', conn.signalingState);
+        console.warn('Unexpected signaling state for answer:', conn.signalingState, '- ignoring');
+        return;
       }
+
       await conn.setRemoteDescription(new RTCSessionDescription(data.answer));
+      console.log('Set remote description (answer) from', peerId);
+
+      // Add buffered candidates
+      if (peer.iceCandidates && peer.iceCandidates.length > 0) {
+        console.log('Adding', peer.iceCandidates.length, 'buffered ICE candidates');
+        for (const candidate of peer.iceCandidates) {
+          await conn.addIceCandidate(new RTCIceCandidate(candidate));
+        }
+        peer.iceCandidates = [];
+      }
+
     } else if (data.candidate) {
+      console.log('Received ICE candidate from', peerId, 'hasRemoteDesc:', peer.hasRemoteDesc);
+
+      // Buffer candidates if remote description not set yet
+      if (!peer.hasRemoteDesc && conn.signalingState !== 'have-remote-offer' && conn.signalingState !== 'stable') {
+        console.log('Buffering ICE candidate for', peerId);
+        if (!peer.iceCandidates) peer.iceCandidates = [];
+        peer.iceCandidates.push(data.candidate);
+        return;
+      }
+
       await conn.addIceCandidate(new RTCIceCandidate(data.candidate));
+      console.log('Added ICE candidate from', peerId);
     }
   } catch(e) {
-    console.warn('Signal error for', peerId, e);
+    console.error('Signal error for', peerId, e);
+    // Don't cleanup on signal error - might be transient
   }
 }
 
 // ─── DATA CHANNEL (file transfer) ────────────────────────────────────────────
-function setupDataChannel(channel, peerId) {
+function setupDataChannel(channel, peerId, onErrorCallback) {
   channel.binaryType = 'arraybuffer';
   let incoming = null;
 
   channel.onclose = () => {
-    // Don't delete peer here — connection may recover. Let onconnectionstatechange handle cleanup.
-    if (peers[peerId]) peers[peerId].channel = null;
+    console.log('Data channel closed for peer', peerId);
+    if (peers[peerId]) {
+      peers[peerId].channel = null;
+      // Reject the channelReady promise so waiting operations fail fast
+      if (peers[peerId].rejectChannel) {
+        peers[peerId].rejectChannel(new Error('Data channel closed'));
+      }
+    }
     renderPeersBar();
   };
 
   channel.onerror = (err) => {
     console.error('Data channel error for peer', peerId, err);
+    if (onErrorCallback) onErrorCallback(err);
   };
 
   channel.onmessage = (e) => {
@@ -1374,29 +1504,67 @@ function setupDataChannel(channel, peerId) {
 
 // ─── SEND FILE ───────────────────────────────────────────────────────────────
 async function sendFileToPeer(file, channel, transferId, nameOverride, sizeOverride, mimeOverride) {
+  // Validate channel is open before starting
+  if (!channel || channel.readyState !== 'open') {
+    throw new Error('Data channel not open');
+  }
+
   const fileName = nameOverride || file.name;
   const fileSize = sizeOverride || file.size;
   const fileMime = mimeOverride || file.type || 'application/octet-stream';
-  channel.send(JSON.stringify({
-    type: 'file-start',
-    id: transferId,
-    name: fileName,
-    size: fileSize,
-    mime: fileMime,
-  }));
+
+  try {
+    channel.send(JSON.stringify({
+      type: 'file-start',
+      id: transferId,
+      name: fileName,
+      size: fileSize,
+      mime: fileMime,
+    }));
+  } catch (err) {
+    console.error('Failed to send file-start:', err);
+    throw err;
+  }
 
   let offset = 0;
+  let lastProgress = 0;
 
-  while (offset < file.size) {
-    const slice = file.slice(offset, offset + CHUNK_SIZE);
+  while (offset < fileSize) {
+    // Check channel state before each chunk
+    if (channel.readyState !== 'open') {
+      console.error('Channel closed mid-transfer for', transferId);
+      throw new Error('Data channel closed during transfer');
+    }
+
+    const slice = file.slice(offset, Math.min(offset + CHUNK_SIZE, fileSize));
     const buffer = await readSlice(slice);
-    channel.send(buffer);
+
+    try {
+      channel.send(buffer);
+    } catch (err) {
+      console.error('Failed to send chunk at offset', offset, ':', err);
+      throw err;
+    }
+
     offset += buffer.byteLength;
-    updateTransferProgress(transferId, (offset / file.size) * 100, 'send');
+    const progress = (offset / fileSize) * 100;
+
+    // Only update UI every 2% to reduce DOM thrashing
+    if (progress - lastProgress >= 2 || progress >= 100) {
+      updateTransferProgress(transferId, progress, 'send');
+      lastProgress = progress;
+    }
+
     await waitForBuffer(channel);
   }
 
-  channel.send(JSON.stringify({ type: 'file-end', id: transferId }));
+  try {
+    channel.send(JSON.stringify({ type: 'file-end', id: transferId }));
+  } catch (err) {
+    console.error('Failed to send file-end:', err);
+    throw err;
+  }
+
   completeTransfer(transferId, 'send');
 }
 
@@ -1409,12 +1577,24 @@ function readSlice(slice) {
   });
 }
 
-function waitForBuffer(channel, threshold = 1024 * 1024) {
+function waitForBuffer(channel, threshold = 256 * 1024) {
+  // Lower threshold to 256KB for better flow control (was 1MB)
+  if (channel.readyState !== 'open') {
+    return Promise.reject(new Error('Channel not open'));
+  }
   if (channel.bufferedAmount < threshold) return Promise.resolve();
-  return new Promise(resolve => {
+
+  return new Promise((resolve, reject) => {
     const check = () => {
-      if (channel.bufferedAmount < threshold) resolve();
-      else setTimeout(check, 50);
+      if (channel.readyState !== 'open') {
+        reject(new Error('Channel closed while waiting for buffer'));
+        return;
+      }
+      if (channel.bufferedAmount < threshold) {
+        resolve();
+      } else {
+        setTimeout(check, 50);
+      }
     };
     setTimeout(check, 50);
   });
@@ -1444,16 +1624,28 @@ async function sendFileToAll(file) {
     if (statusEl) statusEl.textContent = 'Connecting to peers…';
   }
 
-  // channelReady resolves when the data channel is open — works for connecting or already-open channels
+  // Send to all peers that have or will have an open channel
   await Promise.all(activePeers.map(async p => {
     try {
       const channel = await Promise.race([
         p.channelReady,
-        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000))
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Channel open timeout')), 30000))
       ]);
+
+      // Double-check channel is actually open
+      if (channel.readyState !== 'open') {
+        throw new Error('Channel not in open state: ' + channel.readyState);
+      }
+
       await sendFileToPeer(file, channel, transferId);
     } catch(e) {
-      console.warn('Could not send file to peer:', e);
+      console.warn('Could not send file to peer:', e.message || e);
+      // Update UI to show failure for this peer
+      const statusEl = document.getElementById('status-' + transferId);
+      if (statusEl && statusEl.textContent !== 'Sent' && statusEl.textContent !== 'Ready') {
+        statusEl.textContent = 'Failed';
+        statusEl.className = 'transfer-status status-error';
+      }
     }
   }));
 }
