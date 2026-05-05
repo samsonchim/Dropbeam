@@ -1149,12 +1149,12 @@ function handleServerMsg(msg) {
   switch (msg.type) {
     case 'room-joined':
       myPeerId = msg.peerId;
-      msg.peers.forEach(pid => createPeerConnection(pid, true));  // I connect OUT to existing
+      msg.peers.forEach(pid => createPeerConnection(pid, false));  // wait for existing peers to initiate
       break;
 
     case 'peer-joined':
       showToast('New peer joined the room');
-      createPeerConnection(msg.peerId, false);  // ✅ FIX: I accept IN from newcomer
+      createPeerConnection(msg.peerId, true);  // existing peer initiates to newcomer
       break;
 
     case 'peer-left':
