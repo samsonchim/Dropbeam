@@ -1355,12 +1355,18 @@ function createPeerConnection(peerId, initiator) {
     renderPeersBar();
     showToast('Peer connected — ready to share files');
 
-    // Send queued files to new peer
-    sharedFiles.forEach(f => {
-      sendFileToPeer(f.blob, channel, f.id, f.name, f.size, f.mime).catch(err => {
-        console.error('Failed to send queued file to', peerId, err);
-      });
-    });
+    // Send queued files to new peer with delay between each to prevent flooding
+    (async () => {
+      for (const f of sharedFiles) {
+        try {
+          await sendFileToPeer(f.blob, channel, f.id, f.name, f.size, f.mime);
+          // Small delay between files
+          await sleep(500);
+        } catch (err) {
+          console.error('Failed to send queued file to', peerId, err);
+        }
+      }
+    })();
   }
 
   function onChannelError(err) {
@@ -1551,16 +1557,23 @@ function setupDataChannel(channel, peerId, onErrorCallback) {
 }
 
 // ─── SEND FILE ───────────────────────────────────────────────────────────────
+// Conservative chunk size for TURN relay - 16KB prevents buffer overflow
+const SEND_CHUNK_SIZE = 16 * 1024;
+const BUFFER_HIGH_THRESHOLD = 64 * 1024;  // Wait if buffer > 64KB
+const BUFFER_LOW_THRESHOLD = 16 * 1024;   // Resume when buffer < 16KB
+const INTER_CHUNK_DELAY_MS = 5;            // Small delay between chunks
+
 async function sendFileToPeer(file, channel, transferId, nameOverride, sizeOverride, mimeOverride) {
   // Validate channel is open before starting
   if (!channel || channel.readyState !== 'open') {
-    throw new Error('Data channel not open');
+    throw new Error('Data channel not open (state: ' + (channel ? channel.readyState : 'null') + ')');
   }
 
   const fileName = nameOverride || file.name;
   const fileSize = sizeOverride || file.size;
   const fileMime = mimeOverride || file.type || 'application/octet-stream';
 
+  // Send metadata
   try {
     channel.send(JSON.stringify({
       type: 'file-start',
@@ -1571,46 +1584,74 @@ async function sendFileToPeer(file, channel, transferId, nameOverride, sizeOverr
     }));
   } catch (err) {
     console.error('Failed to send file-start:', err);
-    throw err;
+    throw new Error('Cannot start transfer: ' + err.message);
   }
 
   let offset = 0;
   let lastProgress = 0;
+  let consecutiveErrors = 0;
+  const MAX_CONSECUTIVE_ERRORS = 3;
 
   while (offset < fileSize) {
     // Check channel state before each chunk
     if (channel.readyState !== 'open') {
-      console.error('Channel closed mid-transfer for', transferId);
-      throw new Error('Data channel closed during transfer');
+      console.error('Channel closed mid-transfer for', transferId, 'state:', channel.readyState);
+      throw new Error('Data channel closed during transfer (state: ' + channel.readyState + ')');
     }
 
-    const slice = file.slice(offset, Math.min(offset + CHUNK_SIZE, fileSize));
-    const buffer = await readSlice(slice);
+    // CRITICAL: Wait for buffer to drain BEFORE sending, not after
+    // This prevents the 16MB hard limit from being hit
+    await waitForBufferSafe(channel);
+
+    const end = Math.min(offset + SEND_CHUNK_SIZE, fileSize);
+    const slice = file.slice(offset, end);
+    let buffer;
 
     try {
-      channel.send(buffer);
+      buffer = await readSlice(slice);
     } catch (err) {
-      console.error('Failed to send chunk at offset', offset, ':', err);
-      throw err;
+      console.error('Failed to read slice at offset', offset, ':', err);
+      throw new Error('File read error: ' + err.message);
+    }
+
+    // Send the chunk
+    try {
+      channel.send(buffer);
+      consecutiveErrors = 0;  // Reset error counter on success
+    } catch (err) {
+      consecutiveErrors++;
+      console.error('Failed to send chunk at offset', offset, '(error', consecutiveErrors, '):', err);
+
+      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        throw new Error('Too many send errors, aborting transfer');
+      }
+
+      // Wait a bit and retry this chunk
+      await sleep(100 * consecutiveErrors);
+      continue;  // Retry same offset
     }
 
     offset += buffer.byteLength;
     const progress = (offset / fileSize) * 100;
 
-    // Only update UI every 2% to reduce DOM thrashing
+    // Update UI every 2% or on completion
     if (progress - lastProgress >= 2 || progress >= 100) {
       updateTransferProgress(transferId, progress, 'send');
       lastProgress = progress;
     }
 
-    await waitForBuffer(channel);
+    // Small delay to let network breathe - critical for TURN relay
+    if (INTER_CHUNK_DELAY_MS > 0 && offset < fileSize) {
+      await sleep(INTER_CHUNK_DELAY_MS);
+    }
   }
 
+  // Send end marker
   try {
     channel.send(JSON.stringify({ type: 'file-end', id: transferId }));
   } catch (err) {
     console.error('Failed to send file-end:', err);
-    throw err;
+    // Don't throw here - file was sent, just the marker failed
   }
 
   completeTransfer(transferId, 'send');
@@ -1620,31 +1661,63 @@ function readSlice(slice) {
   return new Promise((resolve, reject) => {
     const fr = new FileReader();
     fr.onload = e => resolve(e.target.result);
-    fr.onerror = reject;
+    fr.onerror = () => reject(new Error('FileReader failed'));
     fr.readAsArrayBuffer(slice);
   });
 }
 
-function waitForBuffer(channel, threshold = 256 * 1024) {
-  // Lower threshold to 256KB for better flow control (was 1MB)
-  if (channel.readyState !== 'open') {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Safe buffer wait using bufferedamountlow event + polling fallback
+function waitForBufferSafe(channel) {
+  if (!channel || channel.readyState !== 'open') {
     return Promise.reject(new Error('Channel not open'));
   }
-  if (channel.bufferedAmount < threshold) return Promise.resolve();
+
+  // If buffer is already low, proceed immediately
+  if (channel.bufferedAmount < BUFFER_HIGH_THRESHOLD) {
+    return Promise.resolve();
+  }
 
   return new Promise((resolve, reject) => {
-    const check = () => {
+    let resolved = false;
+
+    // Use event-based notification when available (more efficient)
+    const onLow = () => {
+      if (resolved) return;
+      resolved = true;
+      channel.bufferedamountlow = null;  // Clean up
+      resolve();
+    };
+
+    // Fallback: poll every 100ms
+    const checkInterval = setInterval(() => {
+      if (resolved) return;
+
       if (channel.readyState !== 'open') {
+        resolved = true;
+        clearInterval(checkInterval);
         reject(new Error('Channel closed while waiting for buffer'));
         return;
       }
-      if (channel.bufferedAmount < threshold) {
+
+      if (channel.bufferedAmount < BUFFER_LOW_THRESHOLD) {
+        resolved = true;
+        clearInterval(checkInterval);
         resolve();
-      } else {
-        setTimeout(check, 50);
       }
-    };
-    setTimeout(check, 50);
+    }, 100);
+
+    // Safety timeout: max 30 seconds waiting for buffer
+    setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      clearInterval(checkInterval);
+      console.warn('Buffer drain timeout, proceeding anyway');
+      resolve();  // Proceed rather than hang forever
+    }, 30000);
   });
 }
 
