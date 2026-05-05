@@ -1,8 +1,4 @@
-
-// DropBeam Signaling Server
-// Run with: node server.js
-// Requires: npm install ws
-
+// DropBeam Signaling Server — FIXED
 const WebSocket = require("ws");
 const http = require("http");
 
@@ -33,7 +29,6 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({
   server,
   verifyClient: ({ origin }, callback) => {
-    // Allow connections from the Vercel frontend or no origin (e.g. server-to-server)
     if (!origin || origin === FRONTEND_URL) {
       callback(true);
     } else {
@@ -43,7 +38,6 @@ const wss = new WebSocket.Server({
   },
 });
 
-// rooms: { roomCode: Set<WebSocket> }
 const rooms = new Map();
 
 function broadcast(room, senderWs, message) {
@@ -89,20 +83,21 @@ wss.on("connection", (ws) => {
         if (!rooms.has(room)) rooms.set(room, new Set());
         const members = rooms.get(room);
 
-        // Send current peer list to new joiner
-        const existingPeers = [...members].map((c) => c.peerId);
+        // ✅ FIX: Add to room BEFORE broadcasting
+        members.add(ws);
+
+        // Tell new peer about existing peers (they'll initiate connections OUT)
+        const existingPeers = [...members].filter(c => c !== ws).map((c) => c.peerId);
         ws.send(JSON.stringify({ type: "room-joined", room, peerId, peers: existingPeers }));
 
-        // Notify others
+        // Tell existing peers about new peer (they'll accept connections IN)
         broadcast(room, ws, { type: "peer-joined", peerId });
 
-        members.add(ws);
         console.log(`[${room}] Peer ${peerId} joined. Total: ${members.size}`);
         break;
       }
 
       case "signal": {
-        // WebRTC signaling relay (offer/answer/ICE)
         if (!currentRoom || !msg.to) return;
         const target = [...(rooms.get(currentRoom) || [])].find((c) => c.peerId === msg.to);
         if (target && target.readyState === WebSocket.OPEN) {
