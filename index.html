@@ -793,8 +793,10 @@
     .transfer-item { padding: 12px 16px; }
   }
   
+    
   .link {
     color: #F54927;
+  }
 </style>
 </head>
 <body>
@@ -922,7 +924,7 @@
     </div>
   </main>
 
-  <footer>DropBeam — End-to-end P2P via WebRTC · Files never touch a server by <a class="link" href="https://github.com/samsonchim">Arusi</a></footer>
+  <footer>DropBeam — End-to-end P2P via WebRTC · Files never touch a server by <a class="link" href="https://github.com/samsonchim">Arúsi</a></footer>
 </div>
 
 <div id="toast"></div>
@@ -1181,14 +1183,12 @@ function handleServerMsg(msg) {
   switch (msg.type) {
     case 'room-joined':
       myPeerId = msg.peerId;
-      msg.peers.forEach(pid => createPeerConnection(pid, false));
-      renderPeersBar();
+      msg.peers.forEach(pid => createPeerConnection(pid, false));  // wait for existing peers to initiate
       break;
 
     case 'peer-joined':
       showToast('New peer joined the room');
-      createPeerConnection(msg.peerId, true);
-      renderPeersBar();
+      createPeerConnection(msg.peerId, true);  // existing peer initiates to newcomer
       break;
 
     case 'peer-left':
@@ -1209,10 +1209,13 @@ function handleServerMsg(msg) {
 
 // ─── WEBRTC ──────────────────────────────────────────────────────────────────
 function createPeerConnection(peerId, initiator) {
-  if (peers[peerId]) return;
+  if (peers[peerId]) return; // already exists, don't duplicate
 
   const conn = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  peers[peerId] = { conn, channel: null };
+  // channelReady is a promise that resolves when the data channel is open
+  let resolveChannel;
+  const channelReady = new Promise(res => { resolveChannel = res; });
+  peers[peerId] = { conn, channel: null, channelReady, initiator };
 
   conn.onicecandidate = (e) => {
     if (e.candidate) {
@@ -1221,18 +1224,32 @@ function createPeerConnection(peerId, initiator) {
   };
 
   conn.onconnectionstatechange = () => {
-    if (conn.connectionState === 'connected') {
+    const state = conn.connectionState;
+    if (state === 'connected') {
       renderPeersBar();
-    } else if (conn.connectionState === 'disconnected' || conn.connectionState === 'failed') {
+    } else if (state === 'failed') {
+      // Only clean up on hard failure, not temporary disconnects
+      try { conn.close(); } catch(e) {}
       delete peers[peerId];
       renderPeersBar();
     }
+    // 'disconnected' is transient — WebRTC may recover on its own, don't delete
   };
+
+  function onChannelOpen(channel) {
+    peers[peerId].channel = channel;
+    resolveChannel(channel);
+    renderPeersBar();
+    // Send any files already shared in this room to the new peer
+    sharedFiles.forEach(f => {
+      sendFileToPeer(f.blob, channel, f.id, f.name, f.size, f.mime).catch(console.error);
+    });
+  }
 
   if (initiator) {
     const channel = conn.createDataChannel('files', { ordered: true });
-    peers[peerId].channel = channel;
     setupDataChannel(channel, peerId);
+    channel.addEventListener('open', () => onChannelOpen(channel), { once: true });
 
     conn.createOffer().then(offer => {
       conn.setLocalDescription(offer);
@@ -1240,28 +1257,38 @@ function createPeerConnection(peerId, initiator) {
     });
   } else {
     conn.ondatachannel = (e) => {
-      peers[peerId].channel = e.channel;
-      setupDataChannel(e.channel, peerId);
+      const channel = e.channel;
+      setupDataChannel(channel, peerId);
+      if (channel.readyState === 'open') {
+        onChannelOpen(channel);
+      } else {
+        channel.addEventListener('open', () => onChannelOpen(channel), { once: true });
+      }
     };
   }
 }
 
 async function handleSignal(peerId, data) {
+  // Create connection if we haven't yet (handles race where signal arrives before peer-joined)
   if (!peers[peerId]) {
     createPeerConnection(peerId, false);
   }
 
   const conn = peers[peerId].conn;
 
-  if (data.offer) {
-    await conn.setRemoteDescription(new RTCSessionDescription(data.offer));
-    const answer = await conn.createAnswer();
-    await conn.setLocalDescription(answer);
-    sendWS({ type: 'signal', to: peerId, data: { answer } });
-  } else if (data.answer) {
-    await conn.setRemoteDescription(new RTCSessionDescription(data.answer));
-  } else if (data.candidate) {
-    try { await conn.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch(e) {}
+  try {
+    if (data.offer) {
+      await conn.setRemoteDescription(new RTCSessionDescription(data.offer));
+      const answer = await conn.createAnswer();
+      await conn.setLocalDescription(answer);
+      sendWS({ type: 'signal', to: peerId, data: { answer } });
+    } else if (data.answer) {
+      await conn.setRemoteDescription(new RTCSessionDescription(data.answer));
+    } else if (data.candidate) {
+      await conn.addIceCandidate(new RTCIceCandidate(data.candidate));
+    }
+  } catch(e) {
+    console.warn('Signal error for', peerId, e);
   }
 }
 
@@ -1270,16 +1297,8 @@ function setupDataChannel(channel, peerId) {
   channel.binaryType = 'arraybuffer';
   let incoming = null;
 
-  channel.onopen = () => {
-    renderPeersBar();
-    // Send any already-shared files to this new peer
-    sharedFiles.forEach(f => {
-      sendFileToPeer(f.blob, channel, f.id, f.name, f.size, f.mime).catch(console.error);
-    });
-  };
-
   channel.onclose = () => {
-    delete peers[peerId];
+    // Don't delete peer here — connection may recover. Let onconnectionstatechange handle cleanup.
     renderPeersBar();
   };
 
@@ -1362,25 +1381,15 @@ function waitForBuffer(channel, threshold = 1024 * 1024) {
   });
 }
 
-function waitForChannel(channel, timeout = 10000) {
-  if (channel.readyState === 'open') return Promise.resolve(true);
-  return new Promise(resolve => {
-    const timer = setTimeout(() => resolve(false), timeout);
-    channel.addEventListener('open', () => { clearTimeout(timer); resolve(true); }, { once: true });
-    channel.addEventListener('close', () => { clearTimeout(timer); resolve(false); }, { once: true });
-    channel.addEventListener('error', () => { clearTimeout(timer); resolve(false); }, { once: true });
-  });
-}
-
 async function sendFileToAll(file) {
   const transferId = Math.random().toString(36).substr(2, 10);
   const mime = file.type || 'application/octet-stream';
 
+  // Store so late-joining peers get it when their channel opens
   sharedFiles.push({ id: transferId, blob: file, name: file.name, size: file.size, mime });
   addTransferUI(transferId, file.name, file.size, 'send');
 
-  const activePeers = Object.values(peers).filter(p => p.channel &&
-    (p.channel.readyState === 'open' || p.channel.readyState === 'connecting'));
+  const activePeers = Object.values(peers);
 
   if (activePeers.length === 0) {
     const statusEl = document.getElementById('status-' + transferId);
@@ -1389,9 +1398,17 @@ async function sendFileToAll(file) {
     return;
   }
 
+  // channelReady resolves when the data channel is open — works for connecting or already-open channels
   await Promise.all(activePeers.map(async p => {
-    const ready = await waitForChannel(p.channel);
-    if (ready) await sendFileToPeer(file, p.channel, transferId);
+    try {
+      const channel = await Promise.race([
+        p.channelReady,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000))
+      ]);
+      await sendFileToPeer(file, channel, transferId);
+    } catch(e) {
+      console.warn('Could not send file to peer:', e);
+    }
   }));
 }
 
