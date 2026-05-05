@@ -351,7 +351,8 @@
 
   /* ─── ROOM SCREEN ─── */
   #screen-room {
-    width: 100%    max-width: 720px;
+    width: 100%;
+    max-width: 720px;
     animation: fadeUp 0.4s ease;
     display: none;
   }
@@ -1183,12 +1184,19 @@ function handleServerMsg(msg) {
   switch (msg.type) {
     case 'room-joined':
       myPeerId = msg.peerId;
-      msg.peers.forEach(pid => createPeerConnection(pid, false));  // wait for existing peers to initiate
+      console.log('Joined room as', myPeerId, 'existing peers:', msg.peers);
+      msg.peers.forEach(pid => {
+        if (pid !== myPeerId && !peers[pid]) {
+          createPeerConnection(pid, false);  // wait for existing peers to initiate
+        }
+      });
       break;
 
     case 'peer-joined':
       showToast('New peer joined the room');
-      createPeerConnection(msg.peerId, true);  // existing peer initiates to newcomer
+      if (!peers[msg.peerId]) {
+        createPeerConnection(msg.peerId, true);  // existing peer initiates to newcomer
+      }
       break;
 
     case 'peer-left':
@@ -1216,6 +1224,7 @@ function createPeerConnection(peerId, initiator) {
   let resolveChannel;
   const channelReady = new Promise(res => { resolveChannel = res; });
   peers[peerId] = { conn, channel: null, channelReady, initiator };
+  renderPeersBar(); // Update UI immediately when peer is added
 
   conn.onicecandidate = (e) => {
     if (e.candidate) {
@@ -1225,10 +1234,12 @@ function createPeerConnection(peerId, initiator) {
 
   conn.onconnectionstatechange = () => {
     const state = conn.connectionState;
-    if (state === 'connected') {
+    console.log('Connection state with', peerId, ':', state);
+    if (state === 'connected' || state === 'connecting') {
       renderPeersBar();
-    } else if (state === 'failed') {
-      // Only clean up on hard failure, not temporary disconnects
+    } else if (state === 'failed' || state === 'closed') {
+      // Clean up on hard failure or close
+      console.log('Connection failed/closed with', peerId);
       try { conn.close(); } catch(e) {}
       delete peers[peerId];
       renderPeersBar();
@@ -1236,10 +1247,16 @@ function createPeerConnection(peerId, initiator) {
     // 'disconnected' is transient — WebRTC may recover on its own, don't delete
   };
 
+  conn.oniceconnectionstatechange = () => {
+    console.log('ICE state with', peerId, ':', conn.iceConnectionState);
+  };
+
   function onChannelOpen(channel) {
+    if (!peers[peerId]) return; // Peer may have been removed
     peers[peerId].channel = channel;
     resolveChannel(channel);
     renderPeersBar();
+    showToast('Peer connected — ready to share files');
     // Send any files already shared in this room to the new peer
     sharedFiles.forEach(f => {
       sendFileToPeer(f.blob, channel, f.id, f.name, f.size, f.mime).catch(console.error);
@@ -1251,10 +1268,13 @@ function createPeerConnection(peerId, initiator) {
     setupDataChannel(channel, peerId);
     channel.addEventListener('open', () => onChannelOpen(channel), { once: true });
 
-    conn.createOffer().then(offer => {
-      conn.setLocalDescription(offer);
-      sendWS({ type: 'signal', to: peerId, data: { offer } });
-    });
+    conn.createOffer()
+      .then(offer => conn.setLocalDescription(offer))
+      .then(() => {
+        console.log('Sending offer to', peerId);
+        sendWS({ type: 'signal', to: peerId, data: { offer: conn.localDescription } });
+      })
+      .catch(err => console.error('Error creating offer for', peerId, err));
   } else {
     conn.ondatachannel = (e) => {
       const channel = e.channel;
@@ -1271,18 +1291,32 @@ function createPeerConnection(peerId, initiator) {
 async function handleSignal(peerId, data) {
   // Create connection if we haven't yet (handles race where signal arrives before peer-joined)
   if (!peers[peerId]) {
+    console.log('Creating peer connection for signal from', peerId);
     createPeerConnection(peerId, false);
   }
 
   const conn = peers[peerId].conn;
+  if (!conn) {
+    console.warn('No connection for peer', peerId);
+    return;
+  }
 
   try {
     if (data.offer) {
+      console.log('Received offer from', peerId);
+      if (conn.signalingState !== 'stable' && conn.signalingState !== 'have-local-offer') {
+        console.warn('Unexpected signaling state for offer:', conn.signalingState);
+      }
       await conn.setRemoteDescription(new RTCSessionDescription(data.offer));
       const answer = await conn.createAnswer();
       await conn.setLocalDescription(answer);
       sendWS({ type: 'signal', to: peerId, data: { answer } });
+      console.log('Sent answer to', peerId);
     } else if (data.answer) {
+      console.log('Received answer from', peerId);
+      if (conn.signalingState !== 'have-local-offer') {
+        console.warn('Unexpected signaling state for answer:', conn.signalingState);
+      }
       await conn.setRemoteDescription(new RTCSessionDescription(data.answer));
     } else if (data.candidate) {
       await conn.addIceCandidate(new RTCIceCandidate(data.candidate));
@@ -1299,7 +1333,12 @@ function setupDataChannel(channel, peerId) {
 
   channel.onclose = () => {
     // Don't delete peer here — connection may recover. Let onconnectionstatechange handle cleanup.
+    if (peers[peerId]) peers[peerId].channel = null;
     renderPeersBar();
+  };
+
+  channel.onerror = (err) => {
+    console.error('Data channel error for peer', peerId, err);
   };
 
   channel.onmessage = (e) => {
@@ -1396,6 +1435,13 @@ async function sendFileToAll(file) {
     if (statusEl) statusEl.textContent = 'Waiting for peers…';
     showToast('File queued — will send when a peer joins!');
     return;
+  }
+
+  // Check if any peer has an open channel
+  const hasOpenChannel = activePeers.some(p => p.channel && p.channel.readyState === 'open');
+  if (!hasOpenChannel) {
+    const statusEl = document.getElementById('status-' + transferId);
+    if (statusEl) statusEl.textContent = 'Connecting to peers…';
   }
 
   // channelReady resolves when the data channel is open — works for connecting or already-open channels

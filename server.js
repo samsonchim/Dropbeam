@@ -4,6 +4,7 @@ const http = require("http");
 
 const PORT = process.env.PORT || 8080;
 const FRONTEND_URL = "https://dropbeam-mu.vercel.app";
+const ALLOWED_ORIGINS = [FRONTEND_URL, "http://localhost:8080", "http://localhost:3000", "http://127.0.0.1:8080", "http://127.0.0.1:3000", null];
 
 const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", FRONTEND_URL);
@@ -29,7 +30,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({
   server,
   verifyClient: ({ origin }, callback) => {
-    if (!origin || origin === FRONTEND_URL) {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
       callback(true);
     } else {
       console.warn(`Rejected WebSocket connection from origin: ${origin}`);
@@ -39,6 +40,24 @@ const wss = new WebSocket.Server({
 });
 
 const rooms = new Map();
+
+// Keepalive heartbeat
+const HEARTBEAT_INTERVAL = 30000;
+const heartbeat = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log(`Terminating dead connection for peer ${ws.peerId || "unknown"}`);
+      ws.terminate();
+      return;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_INTERVAL);
+
+wss.on("close", () => {
+  clearInterval(heartbeat);
+});
 
 function broadcast(room, senderWs, message) {
   if (!rooms.has(room)) return;
@@ -61,14 +80,19 @@ function broadcastAll(room, message) {
 }
 
 wss.on("connection", (ws) => {
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+
   let currentRoom = null;
-  let peerId = Math.random().toString(36).substr(2, 8);
+  const peerId = Math.random().toString(36).substr(2, 8);
+  ws.peerId = peerId;
 
   ws.on("message", (rawData) => {
     let msg;
     try {
       msg = JSON.parse(rawData);
     } catch {
+      console.warn(`Peer ${peerId} sent invalid JSON`);
       return;
     }
 
@@ -78,19 +102,18 @@ wss.on("connection", (ws) => {
         if (!room) return;
 
         currentRoom = room;
-        ws.peerId = peerId;
 
         if (!rooms.has(room)) rooms.set(room, new Set());
         const members = rooms.get(room);
 
-        // ✅ FIX: Add to room BEFORE broadcasting
+        // Add to room BEFORE broadcasting
         members.add(ws);
 
-        // Tell new peer about existing peers (they'll initiate connections OUT)
+        // Tell new peer about existing peers (they'll wait for connections IN)
         const existingPeers = [...members].filter(c => c !== ws).map((c) => c.peerId);
         ws.send(JSON.stringify({ type: "room-joined", room, peerId, peers: existingPeers }));
 
-        // Tell existing peers about new peer (they'll accept connections IN)
+        // Tell existing peers about new peer (they'll initiate connections OUT)
         broadcast(room, ws, { type: "peer-joined", peerId });
 
         console.log(`[${room}] Peer ${peerId} joined. Total: ${members.size}`);
@@ -102,6 +125,8 @@ wss.on("connection", (ws) => {
         const target = [...(rooms.get(currentRoom) || [])].find((c) => c.peerId === msg.to);
         if (target && target.readyState === WebSocket.OPEN) {
           target.send(JSON.stringify({ type: "signal", from: peerId, data: msg.data }));
+        } else {
+          console.warn(`Signal target ${msg.to} not found or not open in room ${currentRoom}`);
         }
         break;
       }
@@ -121,22 +146,37 @@ wss.on("connection", (ws) => {
 
   function handleLeave() {
     if (currentRoom && rooms.has(currentRoom)) {
-      rooms.get(currentRoom).delete(ws);
-      broadcast(currentRoom, ws, { type: "peer-left", peerId });
-      console.log(`[${currentRoom}] Peer ${peerId} left. Remaining: ${rooms.get(currentRoom).size}`);
-      if (rooms.get(currentRoom).size === 0) {
+      const roomMembers = rooms.get(currentRoom);
+      const wasInRoom = roomMembers.has(ws);
+      roomMembers.delete(ws);
+
+      if (wasInRoom) {
+        broadcast(currentRoom, ws, { type: "peer-left", peerId });
+        console.log(`[${currentRoom}] Peer ${peerId} left. Remaining: ${roomMembers.size}`);
+      }
+
+      if (roomMembers.size === 0) {
         rooms.delete(currentRoom);
         console.log(`[${currentRoom}] Room closed.`);
       }
+      currentRoom = null;
     }
   }
 
-  ws.on("close", handleLeave);
-  ws.on("error", handleLeave);
+  ws.on("close", (code, reason) => {
+    console.log(`Peer ${peerId} disconnected (code: ${code}, reason: ${reason || "none"})`);
+    handleLeave();
+  });
+
+  ws.on("error", (err) => {
+    console.error(`Peer ${peerId} WebSocket error:`, err.message);
+    // Do NOT call handleLeave here — transient errors shouldn't boot the peer
+  });
 });
 
 server.listen(PORT, () => {
   console.log(`\n✅ DropBeam server running at http://localhost:${PORT}`);
   console.log(`📡 WebSocket signaling active on ws://localhost:${PORT}`);
-  console.log(`🌐 Accepting connections from: ${FRONTEND_URL}\n`);
+  console.log(`🌐 Accepting connections from: ${FRONTEND_URL} (and localhost for dev)`);
+  console.log(`💓 Heartbeat every ${HEARTBEAT_INTERVAL / 1000}s\n`);
 });
